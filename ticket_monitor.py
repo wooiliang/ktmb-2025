@@ -7,13 +7,30 @@ import asyncio
 import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 
-# Fetch bot token and allowed IDs from environment variables
+# Fetch bot token, allowed IDs, and port from environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  # Fallback for testing
 ALLOWED_IDS = [int(id.strip()) for id in os.environ.get("ALLOWED_IDS", "123456789").split(",")]  # Fallback for testing
+PORT = int(os.environ.get("PORT", 10000))  # Default to 10000 for Render
 
 # Dictionary to store active monitoring tasks: {chat_id: {"thread": thread, "stop_event": event, "date": date, "time": time}}
 active_tasks = {}
+
+# Minimal HTTP server to satisfy Render's requirement
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")  # Simple response to keep Render happy
+
+def start_http_server():
+    """Run a dummy HTTP server in a separate thread."""
+    server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
+    print(f"Dummy HTTP server running on port {PORT}...")
+    server.serve_forever()
 
 def get_trip_data(session, search_data, form_validation_code, depart_date):
     """
@@ -56,14 +73,6 @@ def parse_availability(html, departure_time):
 def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, callback, loop):
     """
     Monitor ticket availability and notify via callback when tickets are available.
-    Args:
-        chat_id: Telegram chat ID
-        date: Departure date (YYYY-MM-DD)
-        departure_time: Departure time (HH:MM)
-        check_interval: Seconds between checks
-        stop_event: threading.Event to stop the monitoring
-        callback: Async function to call with notification message and cleanup
-        loop: asyncio event loop from the main thread
     """
     session = requests.Session()
     session.cookies.set(
@@ -87,7 +96,6 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
                 
                 if available_seats > 0:
                     message = f"There are {available_seats} seats available for the train from WOODLANDS CIQ to JB SENTRAL at {departure_time} on {date}."
-                    # Send message and trigger cleanup via callback
                     asyncio.run_coroutine_threadsafe(callback(chat_id, message, stop_event), loop)
                     print(f"Tickets found: {available_seats} seats for {departure_time} on {date}. Stopping monitoring for chat {chat_id}.")
                     break
@@ -105,11 +113,10 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
 # Callback function to send messages and clean up via Telegram
 async def send_telegram_message(chat_id, text, stop_event=None):
     await application.bot.send_message(chat_id=chat_id, text=text)
-    # If stop_event is provided (i.e., tickets found), clean up the task
     if stop_event and chat_id in active_tasks:
         task = active_tasks[chat_id]
-        task["stop_event"].set()  # Ensure the thread stops
-        task["thread"].join()     # Safe to join from main thread
+        task["stop_event"].set()
+        task["thread"].join()
         del active_tasks[chat_id]
         print(f"Cleaned up task for chat {chat_id} after tickets found.")
 
@@ -199,7 +206,11 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("stop", stop))
 application.add_handler(CommandHandler("status", status))
 
-# Start the bot
+# Start the bot and HTTP server
 if __name__ == "__main__":
+    # Start the dummy HTTP server in a separate thread
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+    
     print("Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
