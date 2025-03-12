@@ -15,22 +15,19 @@ import socketserver
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Logs to console
-        # Optionally add a file handler: logging.FileHandler('ticket_monitor.log')
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 # Fetch bot token, allowed IDs, and port from environment variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  # Fallback for testing
-ALLOWED_IDS = [int(id.strip()) for id in os.environ.get("ALLOWED_IDS", "123456789").split(",")]  # Fallback for testing
-PORT = int(os.environ.get("PORT", 10000))  # Default to 10000 for Render
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+ALLOWED_IDS = [int(id.strip()) for id in os.environ.get("ALLOWED_IDS", "123456789").split(",")]
+PORT = int(os.environ.get("PORT", 10000))
 
-# Dictionary to store active monitoring tasks: {chat_id: {"thread": thread, "stop_event": event, "date": date, "time": time}}
+# Dictionary to store active monitoring tasks
 active_tasks = {}
 
-# Minimal HTTP server to satisfy Render's requirement
+# Minimal HTTP server for Render.com
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -45,9 +42,7 @@ def start_http_server():
     server.serve_forever()
 
 def get_trip_data(session, search_data, form_validation_code, depart_date):
-    """
-    Send a POST request to fetch trip data for the specified departure date.
-    """
+    """Fetch trip data from the KTMB API."""
     url = 'https://shuttleonline.ktmb.com.my/ShuttleTrip/Trip'
     data = {
         "SearchData": search_data,
@@ -64,9 +59,7 @@ def get_trip_data(session, search_data, form_validation_code, depart_date):
     return response.json()
 
 def parse_availability(html, departure_time):
-    """
-    Parse the HTML to find the number of available seats for the specified departure time.
-    """
+    """Parse the HTML to find available seats."""
     soup = BeautifulSoup(html, 'html.parser')
     rows = soup.find_all('tr', class_='text-nowrap')
     
@@ -83,16 +76,13 @@ def parse_availability(html, departure_time):
     return 0
 
 def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, callback, loop):
-    """
-    Monitor ticket availability and notify via callback when tickets are available.
-    """
+    """Monitor ticket availability and notify when tickets are found."""
     session = requests.Session()
     session.cookies.set(
         'X-CSRF-TOKEN-COOKIENAME',
         'CfDJ8BLO63HXnMZGiQayUJVcLEp0JE7-Cb9D2zTM8L-xpg3kjYrYxGNF9c63fB5g5KT1ug74mCn0-hMNsRX_aVXmF2tI0At1d_kLOXsOim25UhN9INHTpAvnkdfKX_9_Y2bX2R_0V-GS5To76BhTtEzEUyQ'
     )
     
-    # Static search data and form validation code
     search_data = "tC3dfsxiWMaKt1Nvdm3vWnL/t9iv7tOKqeRjCYtwvTyfaHtg/iHXihQ7SOvTuVPAxxHrDBv6RsMbV4cae87VZASB5ITVUG2scB44wxTMDbOyPfZvLZSTcGLsAJKuBGdbTPq5vFDsv16M1qHvkxTc7pDrVndjI2W0B+fSpqHuHsFg+D4R7hk+c7JJPhp48O0vV1XbIALH2VKyscdhOM4tF4SHcANHTn7HNtmO2bxmDGsBH5GojaLeirgvig06SVCId2oLeypjxYm5YcBcFS5MbmSdjke716Eghk3yUdBOmEE3gn5JfLuEq6UFJ/7f0LwptmfO2AmK7egjih78zpizbjL8YoTL0MJcw8VbPX227mw9HtH6v6Z9S87b1bdip8RLQAGRIMZcoDCA3Nxm/L1yrxmUQL0Wi9+hi0N/VQ4dAIhA5KBgyeKDsKeRegRTuKY3MsC8VHLE3AameYI8hxYsDBrn0Y/PnE2FDVnLNKt3GhaIQ5VEjO8ch/kERbG+13aDbPbbdnHNa/wBK+mz708k5Q=="
     form_validation_code = "I9GTDWsCQsYe9QreH7nJRmaJuylznM1L+nRGoOyGhVv6UXRKLmEpMbP+HyWhoNHZnP7tRWyEBB7xOsDHIHpCi1nJF7O0FV5YbGt+t8qIg7GHP6JmMCVorIYXnD3p2YwRgpsDt31+gNVyCjWllfBRbQ=="
     
@@ -109,20 +99,20 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
                 if available_seats > 0:
                     message = f"There are {available_seats} seats available for the train from WOODLANDS CIQ to JB SENTRAL at {departure_time} on {date}."
                     asyncio.run_coroutine_threadsafe(callback(chat_id, message, stop_event), loop)
-                    logger.info(f"Tickets found: {available_seats} seats for {departure_time} on {date}. Stopping monitoring for chat {chat_id}")
+                    logger.info(f"Tickets found: {available_seats} seats for {departure_time} on {date}. Stopping thread for chat {chat_id}")
                     break
                 else:
-                    logger.info(f"No tickets available for {departure_time} on {date} at {time.ctime()}")
+                    logger.info(f"No tickets available for {departure_time} on {date}")
             else:
-                logger.warning(f"Failed to retrieve trip data at {time.ctime()} for chat {chat_id}")
+                logger.warning(f"Failed to retrieve trip data for chat {chat_id}")
             
             stop_event.wait(check_interval)
             
         except Exception as e:
-            logger.error(f"Error: {str(e)} at {time.ctime()} for chat {chat_id}. Retrying in {check_interval} seconds")
+            logger.error(f"Error in monitoring thread for chat {chat_id}: {str(e)}. Retrying in {check_interval} seconds")
             stop_event.wait(check_interval)
 
-# Callback function to send messages and clean up via Telegram
+# Callback function to send messages and clean up
 async def send_telegram_message(chat_id, text, stop_event=None):
     await application.bot.send_message(chat_id=chat_id, text=text)
     if stop_event and chat_id in active_tasks:
@@ -130,9 +120,10 @@ async def send_telegram_message(chat_id, text, stop_event=None):
         task["stop_event"].set()
         task["thread"].join()
         del active_tasks[chat_id]
-        logger.info(f"Cleaned up task for chat {chat_id} after tickets found")
+        logger.info(f"Cleaned up monitoring thread for chat {chat_id} after tickets found")
+    logger.debug("Bot remains operational, ready to accept new commands")
 
-# Command handlers with user ID restriction and logging
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
@@ -192,6 +183,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del active_tasks[chat_id]
     
     await update.message.reply_text("Monitoring stopped.")
+    logger.debug("Bot remains operational after stopping thread")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -220,7 +212,6 @@ application.add_handler(CommandHandler("status", status))
 
 # Start the bot and HTTP server
 if __name__ == "__main__":
-    # Start the dummy HTTP server in a separate thread
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     
