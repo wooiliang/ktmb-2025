@@ -35,6 +35,12 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+
 def start_http_server():
     """Run a dummy HTTP server in a separate thread."""
     server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
