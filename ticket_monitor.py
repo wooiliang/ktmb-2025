@@ -1,10 +1,12 @@
+from datetime import datetime
+import json
+import os
 import requests
 from bs4 import BeautifulSoup
 import re
 import threading
 import time
 import asyncio
-import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters, ContextTypes
@@ -21,11 +23,13 @@ logger = logging.getLogger(__name__)
 
 # Fetch bot token, allowed IDs, and port from environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-ALLOWED_IDS = [int(id.strip()) for id in os.environ.get("ALLOWED_IDS", "123456789").split(",")]
+ALLOWED_IDS = [int(id.strip().strip('"').strip("'")) for id in os.environ.get("ALLOWED_IDS", "123456789").split(",")]
 PORT = int(os.environ.get("PORT", 10000))
+ACTIVE_FILE = 'active_monitors.json'
 
 # Constants
 CHECK_INTERVAL = 60  # Fixed monitoring interval in seconds
+SAVE_INTERVAL = 60  # Save active monitors every 60 seconds
 
 # Search data for each direction
 SEARCH_DATA_WOODLANDS_TO_JB = "tC3dfsxiWMaKt1Nvdm3vWnL/t9iv7tOKqeRjCYtwvTyfaHtg/iHXihQ7SOvTuVPAxxHrDBv6RsMbV4cae87VZASB5ITVUG2scB44wxTMDbOyPfZvLZSTcGLsAJKuBGdbTPq5vFDsv16M1qHvkxTc7pDrVndjI2W0B+fSpqHuHsFg+D4R7hk+c7JJPhp48O0vV1XbIALH2VKyscdhOM4tF4SHcANHTn7HNtmO2bxmDGsBH5GojaLeirgvig06SVCId2oLeypjxYm5YcBcFS5MbmSdjke716Eghk3yUdBOmEE3gn5JfLuEq6UFJ/7f0LwptmfO2AmK7egjih78zpizbjL8YoTL0MJcw8VbPX227mw9HtH6v6Z9S87b1bdip8RLQAGRIMZcoDCA3Nxm/L1yrxmUQL0Wi9+hi0N/VQ4dAIhA5KBgyeKDsKeRegRTuKY3MsC8VHLE3AameYI8hxYsDBrn0Y/PnE2FDVnLNKt3GhaIQ5VEjO8ch/kERbG+13aDbPbbdnHNa/wBK+mz708k5Q=="
@@ -65,8 +69,83 @@ DIRECTION_CONFIG = {
     }
 }
 
+DIRECTION_TEXT = {
+    "WOODLANDS_TO_JB": "WOODLANDS CIQ to JB SENTRAL",
+    "JB_TO_WOODLANDS": "JB SENTRAL to WOODLANDS CIQ",
+    "JB_TO_SEGAMAT": "JB SENTRAL to SEGAMAT",
+    "SEGAMAT_TO_JB": "SEGAMAT to JB SENTRAL"
+}
+
 # Dictionary to store active monitoring tasks
 active_tasks = {}
+tasks_lock = threading.Lock()
+
+def is_expired(date, departure_time):
+    try:
+        dt = datetime.strptime(f"{date} {departure_time}", "%Y-%m-%d %H:%M")
+        return dt < datetime.now()
+    except ValueError:
+        return False
+
+def is_past_date(date):
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d")
+        return dt.date() < datetime.now().date()
+    except ValueError:
+        return False
+
+def save_active_monitors():
+    with tasks_lock:
+        data = {}
+        for chat_id, tasks in active_tasks.items():
+            data[str(chat_id)] = {}
+            for key, info in tasks.items():
+                data[str(chat_id)][key] = {
+                    'date': info['date'],
+                    'time': info['time'],
+                    'direction': info['direction'],
+                    'current_seats': info.get('current_seats')
+                }
+        with open(ACTIVE_FILE, 'w') as f:
+            json.dump(data, f)
+    logger.info("Saved active monitors")
+
+def load_active_monitors(loop):
+    if not os.path.exists(ACTIVE_FILE):
+        return
+    with open(ACTIVE_FILE, 'r') as f:
+        data = json.load(f)
+    with tasks_lock:
+        for chat_id_str, tasks_data in data.items():
+            chat_id = int(chat_id_str)
+            active_tasks[chat_id] = {}
+            for key, info in tasks_data.items():
+                date = info['date']
+                time_ = info['time']
+                if is_expired(date, time_):
+                    continue
+                direction = info['direction']
+                current_seats = info.get('current_seats')
+                stop_event = threading.Event()
+                thread = threading.Thread(
+                    target=monitor_tickets,
+                    args=(chat_id, date, time_, CHECK_INTERVAL, stop_event, send_telegram_message, loop, direction, current_seats, key)
+                )
+                active_tasks[chat_id][key] = {
+                    "thread": thread,
+                    "stop_event": stop_event,
+                    "date": date,
+                    "time": time_,
+                    "direction": direction,
+                    "current_seats": current_seats
+                }
+                thread.start()
+    logger.info("Loaded active monitors")
+
+def periodic_save(stop_event):
+    while not stop_event.is_set():
+        time.sleep(SAVE_INTERVAL)
+        save_active_monitors()
 
 # Minimal HTTP server for Render.com
 class DummyHandler(BaseHTTPRequestHandler):
@@ -146,8 +225,18 @@ def fetch_trip_info(date, direction):
         logger.error(f"Error fetching trip info for {direction} on {date}: {str(e)}")
     return trips
 
-def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, callback, loop, direction, current_seats):
+def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, callback, loop, direction, current_seats, key):
     """Monitor ticket availability and notify when tickets are found or changed."""
+    if is_expired(date, departure_time):
+        logger.info(f"Monitor expired for {departure_time} on {date} for {key}")
+        with tasks_lock:
+            if chat_id in active_tasks and key in active_tasks[chat_id]:
+                del active_tasks[chat_id][key]
+                if not active_tasks[chat_id]:
+                    del active_tasks[chat_id]
+        save_active_monitors()
+        return
+
     config = DIRECTION_CONFIG[direction]
     session = requests.Session()
     session.cookies.set('X-CSRF-TOKEN-COOKIENAME', config["csrf_cookie_value"])
@@ -155,6 +244,9 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
     logger.info(f"Starting ticket monitoring for {departure_time} on {date} for chat {chat_id}")
     
     while not stop_event.is_set():
+        if is_expired(date, departure_time):
+            logger.info(f"Monitor expired for {departure_time} on {date} for {key}")
+            break
         try:
             trip_data = get_trip_data(session, config["url"], config["search_data"], config["form_validation_code"], date, config["request_verification_token"])
             if trip_data.get('status', False):
@@ -163,14 +255,14 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
                 if current_seats is None:
                     if available_seats > 0:
                         message = f"There are {available_seats} seats available for the train at {departure_time} on {date}."
-                        asyncio.run_coroutine_threadsafe(callback(chat_id, message, stop_event), loop)
-                        logger.info(f"Tickets found: {available_seats} seats for {departure_time} on {date}. Stopping thread for chat {chat_id}")
+                        asyncio.run_coroutine_threadsafe(callback(chat_id, message), loop)
+                        logger.info(f"Tickets found: {available_seats} seats for {departure_time} on {date} for {key}. Thread stopping.")
                         break
                 else:
                     if available_seats != current_seats:
                         message = f"The number of available seats has changed to {available_seats} for the train at {departure_time} on {date}."
-                        asyncio.run_coroutine_threadsafe(callback(chat_id, message, stop_event), loop)
-                        logger.info(f"Seat change detected: {available_seats} seats for {departure_time} on {date}. Stopping thread for chat {chat_id}")
+                        asyncio.run_coroutine_threadsafe(callback(chat_id, message), loop)
+                        logger.info(f"Seat change detected: {available_seats} seats for {departure_time} on {date} for {key}. Thread stopping.")
                         break
                 logger.info(f"Current tickets: {available_seats} for {departure_time} on {date}")
             else:
@@ -179,6 +271,14 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
         except Exception as e:
             logger.error(f"Error in monitoring thread for chat {chat_id}: {str(e)}. Retrying in {check_interval} seconds")
             stop_event.wait(check_interval)
+    
+    with tasks_lock:
+        if chat_id in active_tasks and key in active_tasks[chat_id]:
+            del active_tasks[chat_id][key]
+            if not active_tasks[chat_id]:
+                del active_tasks[chat_id]
+    save_active_monitors()
+    logger.info(f"Thread ended and cleaned up for {key} chat {chat_id}")
 
 def parse_availability(html, departure_time):
     """Parse the HTML to find available seats."""
@@ -196,19 +296,14 @@ def parse_availability(html, departure_time):
             return 0
     return 0
 
-async def send_telegram_message(chat_id, text, stop_event=None):
-    """Send a Telegram message and clean up if tickets are found."""
+async def send_telegram_message(chat_id, text):
+    """Send a Telegram message."""
     await application.bot.send_message(chat_id=chat_id, text=text)
-    if stop_event and chat_id in active_tasks:
-        task = active_tasks[chat_id]
-        task["stop_event"].set()
-        task["thread"].join()
-        del active_tasks[chat_id]
-        logger.info(f"Cleaned up monitoring thread for chat {chat_id} after tickets found")
     logger.debug("Bot remains operational, ready to accept new commands")
 
 # Conversation States
 DIRECTION, DATE, TIME, SEATS = range(4)
+STOP = 4
 
 # Static fallback times in case fetching fails
 TIMES = {
@@ -259,6 +354,9 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Handle the date input and fetch trip info dynamically."""
     text = update.message.text
     if re.match(r'\d{4}-\d{2}-\d{2}', text):
+        if is_past_date(text):
+            await update.message.reply_text("Cannot monitor past departure time.")
+            return ConversationHandler.END
         context.user_data['date'] = text
         direction = context.user_data['direction']
         # Fetch trip info dynamically for the selected date and direction
@@ -332,27 +430,45 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     direction = context.user_data['direction']
     current_seats = context.user_data.get('current_seats')
     
-    if chat_id in active_tasks:
-        await update.message.reply_text("You already have an active monitoring task. Use /stop to terminate it first.")
+    if is_expired(date, departure_time):
+        await update.message.reply_text("Cannot monitor past departure time.")
         return ConversationHandler.END
+    
+    key = f"{direction}_{date}_{departure_time}"
+    
+    with tasks_lock:
+        if chat_id not in active_tasks:
+            active_tasks[chat_id] = {}
+        
+        if key in active_tasks[chat_id]:
+            await update.message.reply_text("You are already monitoring this trip.")
+            return ConversationHandler.END
+        
+        if len(active_tasks[chat_id]) >= 5:
+            await update.message.reply_text("You have reached the maximum of 5 monitoring tasks.")
+            return ConversationHandler.END
     
     stop_event = threading.Event()
     loop = asyncio.get_running_loop()
     thread = threading.Thread(
         target=monitor_tickets,
-        args=(chat_id, date, departure_time, CHECK_INTERVAL, stop_event, send_telegram_message, loop, direction, current_seats)
+        args=(chat_id, date, departure_time, CHECK_INTERVAL, stop_event, send_telegram_message, loop, direction, current_seats, key)
     )
-    active_tasks[chat_id] = {"thread": thread, "stop_event": stop_event, "date": date, "time": departure_time}
-    thread.start()
     
-    if direction == 'WOODLANDS_TO_JB':
-        direction_text = "WOODLANDS CIQ to JB SENTRAL"
-    elif direction == 'JB_TO_WOODLANDS':
-        direction_text = "JB SENTRAL to WOODLANDS CIQ"
-    elif direction == 'JB_TO_SEGAMAT':
-        direction_text = "JB SENTRAL to SEGAMAT"
-    elif direction == 'SEGAMAT_TO_JB':
-        direction_text = "SEGAMAT to JB SENTRAL"
+    with tasks_lock:
+        active_tasks[chat_id][key] = {
+            "thread": thread, 
+            "stop_event": stop_event, 
+            "date": date, 
+            "time": departure_time, 
+            "direction": direction,
+            "current_seats": current_seats
+        }
+    
+    thread.start()
+    save_active_monitors()
+    
+    direction_text = DIRECTION_TEXT[direction]
     
     await update.message.reply_text(
         f"Started monitoring tickets for {departure_time} on {date} from {direction_text}."
@@ -364,43 +480,121 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop the active monitoring task."""
+async def stop_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the stop conversation."""
     user_id = update.effective_user.id
     if user_id not in ALLOWED_IDS:
         await update.message.reply_text("Sorry, you are not authorized to use this bot.")
-        return
+        return ConversationHandler.END
     
     chat_id = update.message.chat_id
-    if chat_id not in active_tasks:
-        await update.message.reply_text("No active monitoring task to stop.")
-        return
+    loop = asyncio.get_running_loop()
+    threads_to_join = []
+    with tasks_lock:
+        if chat_id not in active_tasks or not active_tasks[chat_id]:
+            await update.message.reply_text("No active monitoring tasks to stop.")
+            return ConversationHandler.END
+        
+        tasks = active_tasks[chat_id]
+        if len(tasks) == 1:
+            key = next(iter(tasks))
+            task = tasks[key]
+            task["stop_event"].set()
+            threads_to_join.append(task["thread"])
+    if threads_to_join:
+        for thread in threads_to_join:
+            await loop.run_in_executor(None, thread.join)
+        with tasks_lock:
+            if chat_id in active_tasks:
+                del active_tasks[chat_id]
+        save_active_monitors()
+        await update.message.reply_text("Monitoring stopped.")
+        return ConversationHandler.END
+    else:
+        with tasks_lock:
+            msg = "Active monitoring tasks:\n"
+            stop_list = list(tasks.keys())
+            context.user_data['stop_list'] = stop_list
+            for i, key in enumerate(stop_list, 1):
+                task = tasks[key]
+                direction_text = DIRECTION_TEXT[task['direction']]
+                msg += f"{i}. {direction_text} on {task['date']} at {task['time']}\n"
+            msg += "Reply with the number to stop, or 'all' to stop all."
+        await update.message.reply_text(msg)
+        return STOP
+
+async def stop_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the choice to stop monitoring."""
+    chat_id = update.message.chat_id
+    text = update.message.text.strip().lower()
+    loop = asyncio.get_running_loop()
+    threads_to_join = []
+    with tasks_lock:
+        if chat_id not in active_tasks:
+            await update.message.reply_text("No active monitoring tasks.")
+            return ConversationHandler.END
+        
+        if text == 'all':
+            for key, task in list(active_tasks[chat_id].items()):
+                task["stop_event"].set()
+                threads_to_join.append(task["thread"])
+        else:
+            try:
+                num = int(text)
+                stop_list = context.user_data.get('stop_list', [])
+                if 1 <= num <= len(stop_list):
+                    key = stop_list[num - 1]
+                    if key in active_tasks[chat_id]:
+                        task = active_tasks[chat_id][key]
+                        task["stop_event"].set()
+                        threads_to_join.append(task["thread"])
+                else:
+                    await update.message.reply_text("Invalid number. Please choose from the list.")
+                    return STOP
+            except ValueError:
+                await update.message.reply_text("Invalid input. Please reply with a number or 'all'.")
+                return STOP
     
-    task = active_tasks[chat_id]
-    task["stop_event"].set()
-    task["thread"].join()
-    del active_tasks[chat_id]
-    await update.message.reply_text("Monitoring stopped.")
-    logger.debug("Bot remains operational after stopping thread")
+    for thread in threads_to_join:
+        await loop.run_in_executor(None, thread.join)
+    
+    save_active_monitors()
+    
+    if text == 'all':
+        await update.message.reply_text("All monitoring stopped.")
+    else:
+        await update.message.reply_text("Selected monitoring stopped.")
+    
+    if 'stop_list' in context.user_data:
+        del context.user_data['stop_list']
+    return ConversationHandler.END
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check the status of the monitoring task."""
+    """Check the status of the monitoring tasks."""
     user_id = update.effective_user.id
     if user_id not in ALLOWED_IDS:
         await update.message.reply_text("Sorry, you are not authorized to use this bot.")
         return
     
     chat_id = update.message.chat_id
-    if chat_id in active_tasks:
-        task = active_tasks[chat_id]
-        await update.message.reply_text(f"Monitoring active for {task['time']} on {task['date']}.")
-    else:
-        await update.message.reply_text("No active monitoring task.")
+    with tasks_lock:
+        if chat_id not in active_tasks or not active_tasks[chat_id]:
+            await update.message.reply_text("No active monitoring tasks.")
+        else:
+            msg = "Active monitoring tasks:\n"
+            for key, task in active_tasks[chat_id].items():
+                direction_text = DIRECTION_TEXT[task['direction']]
+                msg += f"- {direction_text} on {task['date']} at {task['time']}\n"
+            await update.message.reply_text(msg)
+
+async def post_init(application: Application) -> None:
+    loop = asyncio.get_running_loop()
+    load_active_monitors(loop)
 
 # Set up the bot application
-application = Application.builder().token(BOT_TOKEN).build()
+application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-# Define the conversation handler
+# Define the main conversation handler
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler('start', start)],
     states={
@@ -412,9 +606,18 @@ conv_handler = ConversationHandler(
     fallbacks=[CommandHandler('cancel', cancel)],
 )
 
+# Define the stop conversation handler
+stop_handler = ConversationHandler(
+    entry_points=[CommandHandler('stop', stop_start)],
+    states={
+        STOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, stop_choose)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
 # Add handlers to the application
 application.add_handler(conv_handler)
-application.add_handler(CommandHandler("stop", stop))
+application.add_handler(stop_handler)
 application.add_handler(CommandHandler("status", status))
 
 # Start the bot and HTTP server
@@ -422,5 +625,14 @@ if __name__ == "__main__":
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     
+    save_stop_event = threading.Event()
+    save_thread = threading.Thread(target=periodic_save, args=(save_stop_event,))
+    save_thread.start()
+    
     logger.info("Bot is running")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # On shutdown
+    save_stop_event.set()
+    save_thread.join()
+    save_active_monitors()
