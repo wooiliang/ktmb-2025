@@ -243,6 +243,23 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
     
     logger.info(f"Starting ticket monitoring for {departure_time} on {date} for chat {chat_id}")
     
+    # Initial fetch to set current_seats if None
+    if current_seats is None:
+        try:
+            trip_data = get_trip_data(session, config["url"], config["search_data"], config["form_validation_code"], date, config["request_verification_token"])
+            if trip_data.get('status', False):
+                html = trip_data['data']
+                available_seats = parse_availability(html, departure_time)
+                current_seats = available_seats
+                with tasks_lock:
+                    if chat_id in active_tasks and key in active_tasks[chat_id]:
+                        active_tasks[chat_id][key]['current_seats'] = current_seats
+                logger.info(f"Initial seats set to {current_seats} for {departure_time} on {date}")
+            else:
+                logger.warning(f"Failed to retrieve initial trip data for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Error fetching initial seats for chat {chat_id}: {str(e)}")
+    
     while not stop_event.is_set():
         if is_expired(date, departure_time):
             logger.info(f"Monitor expired for {departure_time} on {date} for {key}")
@@ -252,18 +269,14 @@ def monitor_tickets(chat_id, date, departure_time, check_interval, stop_event, c
             if trip_data.get('status', False):
                 html = trip_data['data']
                 available_seats = parse_availability(html, departure_time)
-                if current_seats is None:
-                    if available_seats > 0:
-                        message = f"There are {available_seats} seats available for the train at {departure_time} on {date}."
-                        asyncio.run_coroutine_threadsafe(callback(chat_id, message), loop)
-                        logger.info(f"Tickets found: {available_seats} seats for {departure_time} on {date} for {key}. Thread stopping.")
-                        break
-                else:
-                    if available_seats != current_seats:
-                        message = f"The number of available seats has changed to {available_seats} for the train at {departure_time} on {date}."
-                        asyncio.run_coroutine_threadsafe(callback(chat_id, message), loop)
-                        logger.info(f"Seat change detected: {available_seats} seats for {departure_time} on {date} for {key}. Thread stopping.")
-                        break
+                if current_seats is not None and available_seats > current_seats:
+                    message = f"The number of available seats has increased to {available_seats} for the train at {departure_time} on {date}."
+                    asyncio.run_coroutine_threadsafe(callback(chat_id, message), loop)
+                    logger.info(f"Seat increase detected: {available_seats} seats for {departure_time} on {date} for {key}")
+                current_seats = available_seats
+                with tasks_lock:
+                    if chat_id in active_tasks and key in active_tasks[chat_id]:
+                        active_tasks[chat_id][key]['current_seats'] = current_seats
                 logger.info(f"Current tickets: {available_seats} for {departure_time} on {date}")
             else:
                 logger.warning(f"Failed to retrieve trip data for chat {chat_id}")
@@ -302,8 +315,8 @@ async def send_telegram_message(chat_id, text):
     logger.debug("Bot remains operational, ready to accept new commands")
 
 # Conversation States
-DIRECTION, DATE, TIME, SEATS = range(4)
-STOP = 4
+DIRECTION, DATE, TIME = range(3)
+STOP = 3
 
 # Static fallback times in case fetching fails
 TIMES = {
@@ -385,7 +398,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return DATE
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the time choice and conditionally ask for current seats or start monitoring."""
+    """Handle the time choice and start monitoring."""
     text = update.message.text
     trips = context.user_data.get('trips', [])
     
@@ -398,28 +411,6 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     except ValueError:
         await update.message.reply_text("Invalid choice. Please reply with a number from the list.")
         return TIME
-    
-    direction = context.user_data['direction']
-    if direction in ['JB_TO_SEGAMAT', 'SEGAMAT_TO_JB']:
-        await update.message.reply_text(
-            "Please enter the current number of available seats (optional, reply 'skip' or leave blank to check for >0)."
-        )
-        return SEATS
-    else:
-        context.user_data['current_seats'] = None
-        return await start_monitoring(update, context)
-
-async def choose_seats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the current seats input and start monitoring."""
-    text = update.message.text.strip().lower()
-    if text in ['', 'none', 'skip']:
-        context.user_data['current_seats'] = None
-    else:
-        try:
-            context.user_data['current_seats'] = int(text)
-        except ValueError:
-            await update.message.reply_text("Invalid number. Please enter a number or 'skip'.")
-            return SEATS
     
     return await start_monitoring(update, context)
 
@@ -601,7 +592,6 @@ conv_handler = ConversationHandler(
         DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_direction)],
         DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_date)],
         TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_time)],
-        SEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_seats)],
     },
     fallbacks=[CommandHandler('cancel', cancel)],
 )
